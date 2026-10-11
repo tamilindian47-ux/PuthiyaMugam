@@ -1,7 +1,7 @@
 runpod>=1.7.0
+numpy==1.26.4
 opencv-python-headless
 requests
-numpy
 tqdm
 insightface>=0.7.3
 basicsr>=1.4.2
