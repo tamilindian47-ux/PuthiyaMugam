@@ -15,9 +15,8 @@ sys.stdout.flush()
 try:
     import insightface
     from gfpgan import GFPGANer
-
-    # Detect execution providers safely
     import onnxruntime as ort
+
     available_providers = ort.get_available_providers()
     print(f"Available ONNX providers: {available_providers}")
     
@@ -25,18 +24,18 @@ try:
     print(f"Using providers: {selected_providers}")
 
     # 1. Warm load detector
-    print("Loading buffalo_l face detector...")
+    print("Loading buffalo_l detector...")
     face_app = insightface.app.FaceAnalysis(name="buffalo_l", root="/root/.insightface", providers=selected_providers)
     face_app.prepare(ctx_id=0, det_size=(640, 640))
 
     # 2. Warm load Inswapper
-    print("Loading Inswapper ONNX model...")
+    print("Loading Inswapper ONNX...")
     model_path = "/app/checkpoints/inswapper_128.onnx"
     try:
         from insightface.model_zoo.inswapper import INSwapper
         swapper = INSwapper(model_file=model_path, session_options=None)
     except Exception as e:
-        print(f"Loading via model_zoo fallback: {e}")
+        print(f"Fallback loading swapper: {e}")
         swapper = insightface.model_zoo.get_model(model_path, download=False)
 
     # 3. Warm load GFPGAN
@@ -52,7 +51,7 @@ try:
     sys.stdout.flush()
 
 except Exception as init_err:
-    print("FATAL CONTAINER INITIALIZATION ERROR:")
+    print("FATAL INITIALIZATION ERROR:")
     traceback.print_exc()
     sys.stdout.flush()
     raise init_err
@@ -82,7 +81,6 @@ def decode_image(data_or_url):
             os.remove(temp)
 
 
-# Pure NumPy Identity Clustering (No external sklearn dependency)
 def cluster_embeddings_numpy(detections, threshold=0.42):
     clusters = []
     for i, d in enumerate(detections):
