@@ -7,4 +7,5 @@ facexlib
 torchvision
 requests
 numpy
+scikit-learn
 tqdm
