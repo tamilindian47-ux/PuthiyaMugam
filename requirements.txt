@@ -1,6 +1,6 @@
 runpod
 numpy==1.26.4
-onnxruntime-gpu[cuda,cudnn]
+onnxruntime-gpu==1.18.0
 insightface==0.7.3
 opencv-python-headless==4.9.0.80
 pillow
