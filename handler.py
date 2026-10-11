@@ -1,47 +1,76 @@
 import os
+import sys
 import cv2
 import uuid
 import base64
-import runpod
+import traceback
 import subprocess
 import requests
 import numpy as np
-import insightface
-from gfpgan import GFPGANer
-from sklearn.cluster import DBSCAN
+import runpod
 
-# Warm load InsightFace and GFPGAN
-app = insightface.app.FaceAnalysis(name="buffalo_l", root="/root/.insightface")
-app.prepare(ctx_id=0, det_size=(640, 640))
+print("=== Starting Worker Initialization ===")
+sys.stdout.flush()
 
-swapper = insightface.model_zoo.get_model(
-    "/app/checkpoints/inswapper_128.onnx",
-    download=False,
-    provider_options=[{"device_id": 0}]
-)
+try:
+    import insightface
+    from gfpgan import GFPGANer
 
-gfpgan = GFPGANer(
-    model_path="/app/checkpoints/GFPGANv1.4.pth",
-    upscale=1,
-    arch="clean",
-    channel_multiplier=2,
-    bg_upsampler=None
-)
+    # Detect execution providers safely
+    import onnxruntime as ort
+    available_providers = ort.get_available_providers()
+    print(f"Available ONNX providers: {available_providers}")
+    
+    selected_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in available_providers else ['CPUExecutionProvider']
+    print(f"Using providers: {selected_providers}")
+
+    # 1. Warm load detector
+    print("Loading buffalo_l face detector...")
+    face_app = insightface.app.FaceAnalysis(name="buffalo_l", root="/root/.insightface", providers=selected_providers)
+    face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+    # 2. Warm load Inswapper
+    print("Loading Inswapper ONNX model...")
+    model_path = "/app/checkpoints/inswapper_128.onnx"
+    try:
+        from insightface.model_zoo.inswapper import INSwapper
+        swapper = INSwapper(model_file=model_path, session_options=None)
+    except Exception as e:
+        print(f"Loading via model_zoo fallback: {e}")
+        swapper = insightface.model_zoo.get_model(model_path, download=False)
+
+    # 3. Warm load GFPGAN
+    print("Loading GFPGAN Restorer...")
+    gfpgan = GFPGANer(
+        model_path="/app/checkpoints/GFPGANv1.4.pth",
+        upscale=1,
+        arch="clean",
+        channel_multiplier=2,
+        bg_upsampler=None
+    )
+    print("=== All Models Loaded Successfully! ===")
+    sys.stdout.flush()
+
+except Exception as init_err:
+    print("FATAL CONTAINER INITIALIZATION ERROR:")
+    traceback.print_exc()
+    sys.stdout.flush()
+    raise init_err
+
 
 def resolve_input_to_file(data_or_url, out_path):
-    """Handles both URL and Base64 uploads."""
     if data_or_url.startswith("http://") or data_or_url.startswith("https://"):
         resp = requests.get(data_or_url, timeout=60)
         resp.raise_for_status()
         with open(out_path, "wb") as f:
             f.write(resp.content)
     else:
-        # Base64 string
         if "," in data_or_url:
             data_or_url = data_or_url.split(",", 1)[1]
         raw_bytes = base64.b64decode(data_or_url)
         with open(out_path, "wb") as f:
             f.write(raw_bytes)
+
 
 def decode_image(data_or_url):
     temp = f"/tmp/img_{uuid.uuid4().hex[:6]}.jpg"
@@ -52,61 +81,30 @@ def decode_image(data_or_url):
         if os.path.exists(temp):
             os.remove(temp)
 
-# --- ACTION 1: DETECT & CLUSTER UNIQUE PEOPLE IN VIDEO/IMAGE ---
-def detect_unique_people(media_path, is_video=True):
-    detections = []  # list of dicts: {'crop': img, 'embedding': vec, 'score': area}
 
-    if not is_video:
-        frame = cv2.imread(media_path)
-        faces = app.get(frame)
-        for f in faces:
-            box = f.bbox.astype(int)
-            x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
-            crop = frame[y1:y2, x1:x2]
-            detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2-x1)*(y2-y1)})
-    else:
-        cap = cv2.VideoCapture(media_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
-        step = max(1, total_frames // 30)  # sample ~30 representative frames across video
-        frame_idx = 0
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
+# Pure NumPy Identity Clustering (No external sklearn dependency)
+def cluster_embeddings_numpy(detections, threshold=0.42):
+    clusters = []
+    for i, d in enumerate(detections):
+        vec = d['embedding']
+        matched = False
+        for c in clusters:
+            centroid = np.mean([detections[idx]['embedding'] for idx in c], axis=0)
+            centroid = centroid / np.linalg.norm(centroid)
+            if float(np.dot(vec, centroid)) >= (1.0 - threshold):
+                c.append(i)
+                matched = True
                 break
-            if frame_idx % step == 0:
-                faces = app.get(frame)
-                for f in faces:
-                    box = f.bbox.astype(int)
-                    x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
-                    if (x2 - x1) > 50 and (y2 - y1) > 50:
-                        crop = frame[y1:y2, x1:x2]
-                        detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2-x1)*(y2-y1)})
-            frame_idx += 1
-        cap.release()
-
-    if not detections:
-        return []
-
-    # Cluster identities using DBSCAN on normalized cosine distance
-    embeddings = np.array([d['embedding'] for d in detections])
-    # metric='cosine', eps=0.45 (same person usually < 0.45 cosine distance)
-    clustering = DBSCAN(eps=0.42, min_samples=1, metric='cosine').fit(embeddings)
-    labels = clustering.labels_
+        if not matched:
+            clusters.append([i])
 
     unique_characters = []
-    unique_labels = [l for l in set(labels) if l != -1]
-    
-    for l in unique_labels:
-        cluster_indices = [i for i, lbl in enumerate(labels) if lbl == l]
-        # Best crop has largest area/highest detection quality
-        best_idx = max(cluster_indices, key=lambda idx: detections[idx]['score'])
-        # Centroid identity embedding
-        cluster_embeddings = embeddings[cluster_indices]
-        centroid = np.mean(cluster_embeddings, axis=0)
+    for l, c_indices in enumerate(clusters):
+        best_idx = max(c_indices, key=lambda idx: detections[idx]['score'])
+        cluster_vecs = [detections[idx]['embedding'] for idx in c_indices]
+        centroid = np.mean(cluster_vecs, axis=0)
         centroid = centroid / np.linalg.norm(centroid)
 
-        # Encode thumbnail to JPEG base64
         _, buf = cv2.imencode(".jpg", detections[best_idx]['crop'])
         thumb_b64 = base64.b64encode(buf).decode("utf-8")
 
@@ -115,20 +113,51 @@ def detect_unique_people(media_path, is_video=True):
             "thumbnail_base64": thumb_b64,
             "embedding": centroid.tolist()
         })
-
     return unique_characters
 
-# --- ACTION 2: PERFORM PERSISTENT FACE SWAP ---
-def execute_swap(media_path, is_video, swap_targets, pipeline="fast"):
-    """
-    swap_targets schema:
-    [
-      { "target_embedding": [...512 floats...], "source_face": FaceObj }
-    ]
-    """
+
+def detect_unique_people(media_path, is_video=True):
+    detections = []
     if not is_video:
         frame = cv2.imread(media_path)
-        faces = app.get(frame)
+        faces = face_app.get(frame)
+        for f in faces:
+            box = f.bbox.astype(int)
+            x1, y1 = max(0, box[0]), max(0, box[1])
+            x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
+            crop = frame[y1:y2, x1:x2]
+            detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2-x1)*(y2-y1)})
+    else:
+        cap = cv2.VideoCapture(media_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
+        step = max(1, total_frames // 30)
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % step == 0:
+                faces = face_app.get(frame)
+                for f in faces:
+                    box = f.bbox.astype(int)
+                    x1, y1 = max(0, box[0]), max(0, box[1])
+                    x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
+                    if (x2 - x1) > 40 and (y2 - y1) > 40:
+                        crop = frame[y1:y2, x1:x2]
+                        detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2-x1)*(y2-y1)})
+            frame_idx += 1
+        cap.release()
+
+    if not detections:
+        return []
+
+    return cluster_embeddings_numpy(detections)
+
+
+def execute_swap(media_path, is_video, swap_targets, pipeline="fast"):
+    if not is_video:
+        frame = cv2.imread(media_path)
+        faces = face_app.get(frame)
         for face in faces:
             for target in swap_targets:
                 sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
@@ -140,7 +169,6 @@ def execute_swap(media_path, is_video, swap_targets, pipeline="fast"):
         _, out_buf = cv2.imencode(".jpg", frame)
         return {"status": "success", "media_type": "image", "base64": base64.b64encode(out_buf).decode("utf-8")}
 
-    # Video Mode
     temp_id = uuid.uuid4().hex[:8]
     tmp_swapped = f"/tmp/swap_{temp_id}.mp4"
     tmp_final = f"/tmp/final_{temp_id}.mp4"
@@ -155,10 +183,9 @@ def execute_swap(media_path, is_video, swap_targets, pipeline="fast"):
         ret, frame = cap.read()
         if not ret:
             break
-        faces = app.get(frame)
+        faces = face_app.get(frame)
         for face in faces:
             for target in swap_targets:
-                # Cosine similarity matching
                 sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
                 if sim >= 0.40:
                     frame = swapper.get(frame, face, target["source_face"], paste_back=True)
@@ -185,11 +212,11 @@ def execute_swap(media_path, is_video, swap_targets, pipeline="fast"):
 
     return {"status": "success", "media_type": "video", "base64": vid_b64}
 
-# --- RUNPOD MAIN ROUTER ---
+
 def handler(event):
     job_input = event.get("input", {})
-    action = job_input.get("action", "swap")  # "detect" or "swap"
-    media_data = job_input.get("media")  # URL or base64 string
+    action = job_input.get("action", "swap")
+    media_data = job_input.get("media")
     is_video = job_input.get("is_video", True)
 
     if not media_data:
@@ -202,20 +229,18 @@ def handler(event):
     try:
         resolve_input_to_file(media_data, tmp_media)
 
-        # 1. Step 1: Detect unique persons
         if action == "detect":
             characters = detect_unique_people(tmp_media, is_video=is_video)
             return {"status": "success", "characters": characters}
 
-        # 2. Step 2: Swap matched identities
         elif action == "swap":
             pipeline = job_input.get("pipeline", "fast")
-            swaps = job_input.get("swaps", [])  # list of { target_embedding: [...], new_face: url/b64 }
+            swaps = job_input.get("swaps", [])
 
             swap_targets = []
             for s in swaps:
                 src_img = decode_image(s["new_face"])
-                src_faces = app.get(src_img)
+                src_faces = face_app.get(src_img)
                 if src_faces:
                     swap_targets.append({
                         "target_embedding": np.array(s["target_embedding"], dtype=np.float32),
@@ -227,9 +252,11 @@ def handler(event):
         return {"error": f"Unknown action '{action}'"}
 
     except Exception as e:
+        traceback.print_exc()
         return {"status": "failed", "error": str(e)}
     finally:
         if os.path.exists(tmp_media):
             os.remove(tmp_media)
+
 
 runpod.serverless.start({"handler": handler})
