@@ -1,5 +1,10 @@
 import os
 import sys
+
+# CRITICAL: Importing torch first registers CUDA & cuDNN shared libraries
+# into Python's address space so ONNX Runtime can find CUDAExecutionProvider
+import torch
+
 import cv2
 import uuid
 import base64
@@ -12,28 +17,32 @@ import insightface
 import runpod
 
 print("=== Starting Worker Initialization ===")
+print(f"PyTorch CUDA Available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"PyTorch Device Name: {torch.cuda.get_device_name(0)}")
+
+# Dynamically add torch's bundled CUDA/cuDNN libraries to LD_LIBRARY_PATH
+torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
+os.environ["LD_LIBRARY_PATH"] = f"{torch_lib_path}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+
 sys.stdout.flush()
 
 try:
-    # 1. Enforce CUDA Execution Provider
     available_providers = ort.get_available_providers()
     print(f"Available ONNX providers detected: {available_providers}")
 
-    if 'CUDAExecutionProvider' not in available_providers:
-        print("WARNING: CUDAExecutionProvider not detected in ort.get_available_providers()!")
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-    else:
-        providers = [
-            ('CUDAExecutionProvider', {
-                'device_id': 0,
-                'arena_extend_strategy': 'kNextPowerOfTwo',
-                'cudnn_conv_algo_search': 'DEFAULT',
-            }),
-            'CPUExecutionProvider'
-        ]
+    # Set strict GPU provider settings
+    providers = [
+        ('CUDAExecutionProvider', {
+            'device_id': 0,
+            'arena_extend_strategy': 'kNextPowerOfTwo',
+            'cudnn_conv_algo_search': 'DEFAULT',
+        }),
+        'CPUExecutionProvider'
+    ]
 
-    # 2. Warm load Buffalo_L detector
-    print("Loading buffalo_l detector...")
+    # 1. Warm load Buffalo_L detector on GPU (ctx_id=0)
+    print("Loading buffalo_l detector onto GPU...")
     face_app = insightface.app.FaceAnalysis(
         name="buffalo_l",
         root="/root/.insightface",
@@ -41,7 +50,7 @@ try:
     )
     face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-    # 3. Warm load Inswapper directly into GPU VRAM
+    # 2. Warm load Inswapper model onto GPU
     print("Loading Inswapper ONNX onto GPU...")
     model_path = "/app/checkpoints/inswapper_128.onnx"
     swapper = insightface.model_zoo.get_model(
