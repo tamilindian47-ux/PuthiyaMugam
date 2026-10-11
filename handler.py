@@ -15,28 +15,34 @@ print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
 
 try:
-    # 1. Verify available ONNX execution providers
+    # 1. Enforce CUDA Execution Provider
     available_providers = ort.get_available_providers()
-    print(f"Available ONNX providers: {available_providers}")
-    providers = (
-        ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        if 'CUDAExecutionProvider' in available_providers
-        else ['CPUExecutionProvider']
-    )
-    print(f"Selected providers: {providers}")
+    print(f"Available ONNX providers detected: {available_providers}")
 
-    # 2. Warm load InsightFace Buffalo_L face detector
+    if 'CUDAExecutionProvider' not in available_providers:
+        print("WARNING: CUDAExecutionProvider not detected in ort.get_available_providers()!")
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    else:
+        providers = [
+            ('CUDAExecutionProvider', {
+                'device_id': 0,
+                'arena_extend_strategy': 'kNextPowerOfTwo',
+                'cudnn_conv_algo_search': 'DEFAULT',
+            }),
+            'CPUExecutionProvider'
+        ]
+
+    # 2. Warm load Buffalo_L detector
     print("Loading buffalo_l detector...")
     face_app = insightface.app.FaceAnalysis(
         name="buffalo_l",
         root="/root/.insightface",
         providers=providers
     )
-    ctx_id = 0 if 'CUDAExecutionProvider' in providers else -1
-    face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+    face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-    # 3. Warm load Inswapper ONNX model directly with matched providers
-    print("Loading Inswapper ONNX...")
+    # 3. Warm load Inswapper directly into GPU VRAM
+    print("Loading Inswapper ONNX onto GPU...")
     model_path = "/app/checkpoints/inswapper_128.onnx"
     swapper = insightface.model_zoo.get_model(
         model_path,
@@ -44,7 +50,7 @@ try:
         providers=providers
     )
 
-    print("=== Worker Successfully Initialized and Models Ready ===")
+    print("=== Worker Successfully Initialized and Models Loaded to GPU ===")
     sys.stdout.flush()
 
 except Exception as init_err:
