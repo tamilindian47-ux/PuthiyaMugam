@@ -1,0 +1,10 @@
+runpod>=1.7.0
+opencv-python-headless
+insightface>=0.7.3
+onnxruntime-gpu
+gfpgan
+facexlib
+torchvision
+requests
+numpy
+tqdm
