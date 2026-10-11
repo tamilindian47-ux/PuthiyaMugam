@@ -24,17 +24,13 @@ try:
     # 2. Warm load InsightFace Buffalo_L face detector
     print("Loading buffalo_l detector...")
     face_app = insightface.app.FaceAnalysis(name="buffalo_l", root="/root/.insightface", providers=providers)
-    face_app.prepare(ctx_id=0, det_size=(640, 640))
+    ctx_id = 0 if 'CUDAExecutionProvider' in providers else -1
+    face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
 
-    # 3. Warm load Inswapper ONNX model directly
+    # 3. Warm load Inswapper ONNX model directly with matching providers
     print("Loading Inswapper ONNX...")
     model_path = "/app/checkpoints/inswapper_128.onnx"
-    try:
-        from insightface.model_zoo.inswapper import INSwapper
-        swapper = INSwapper(model_file=model_path)
-    except Exception as e:
-        print(f"Fallback loading swapper: {e}")
-        swapper = insightface.model_zoo.get_model(model_path, download=False)
+    swapper = insightface.model_zoo.get_model(model_path, download=False, providers=providers)
 
     print("=== Worker Successfully Initialized and Models Ready ===")
     sys.stdout.flush()
