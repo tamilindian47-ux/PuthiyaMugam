@@ -7,47 +7,36 @@ import traceback
 import subprocess
 import requests
 import numpy as np
+import onnxruntime as ort
+import insightface
 import runpod
 
 print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
 
 try:
-    import insightface
-    from gfpgan import GFPGANer
-    import onnxruntime as ort
-
+    # 1. Verify CUDA execution provider
     available_providers = ort.get_available_providers()
     print(f"Available ONNX providers: {available_providers}")
-    
-    selected_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in available_providers else ['CPUExecutionProvider']
-    print(f"Using providers: {selected_providers}")
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in available_providers else ['CPUExecutionProvider']
+    print(f"Selected providers: {providers}")
 
-    # 1. Warm load detector
+    # 2. Warm load InsightFace Buffalo_L face detector
     print("Loading buffalo_l detector...")
-    face_app = insightface.app.FaceAnalysis(name="buffalo_l", root="/root/.insightface", providers=selected_providers)
+    face_app = insightface.app.FaceAnalysis(name="buffalo_l", root="/root/.insightface", providers=providers)
     face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-    # 2. Warm load Inswapper
+    # 3. Warm load Inswapper ONNX model directly
     print("Loading Inswapper ONNX...")
     model_path = "/app/checkpoints/inswapper_128.onnx"
     try:
         from insightface.model_zoo.inswapper import INSwapper
-        swapper = INSwapper(model_file=model_path, session_options=None)
+        swapper = INSwapper(model_file=model_path)
     except Exception as e:
         print(f"Fallback loading swapper: {e}")
         swapper = insightface.model_zoo.get_model(model_path, download=False)
 
-    # 3. Warm load GFPGAN
-    print("Loading GFPGAN Restorer...")
-    gfpgan = GFPGANer(
-        model_path="/app/checkpoints/GFPGANv1.4.pth",
-        upscale=1,
-        arch="clean",
-        channel_multiplier=2,
-        bg_upsampler=None
-    )
-    print("=== All Models Loaded Successfully! ===")
+    print("=== Worker Successfully Initialized and Models Ready ===")
     sys.stdout.flush()
 
 except Exception as init_err:
@@ -152,7 +141,7 @@ def detect_unique_people(media_path, is_video=True):
     return cluster_embeddings_numpy(detections)
 
 
-def execute_swap(media_path, is_video, swap_targets, pipeline="fast"):
+def execute_swap(media_path, is_video, swap_targets):
     if not is_video:
         frame = cv2.imread(media_path)
         faces = face_app.get(frame)
@@ -161,8 +150,6 @@ def execute_swap(media_path, is_video, swap_targets, pipeline="fast"):
                 sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
                 if sim >= 0.40:
                     frame = swapper.get(frame, face, target["source_face"], paste_back=True)
-                    if pipeline in ["gfpgan", "codeformer"]:
-                        _, _, frame = gfpgan.enhance(frame, has_aligned=False, only_center_face=True, paste_back=True)
                     break
         _, out_buf = cv2.imencode(".jpg", frame)
         return {"status": "success", "media_type": "image", "base64": base64.b64encode(out_buf).decode("utf-8")}
@@ -187,8 +174,6 @@ def execute_swap(media_path, is_video, swap_targets, pipeline="fast"):
                 sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
                 if sim >= 0.40:
                     frame = swapper.get(frame, face, target["source_face"], paste_back=True)
-                    if pipeline in ["gfpgan", "codeformer"]:
-                        _, _, frame = gfpgan.enhance(frame, has_aligned=False, only_center_face=True, paste_back=True)
                     break
         writer.write(frame)
 
@@ -232,9 +217,7 @@ def handler(event):
             return {"status": "success", "characters": characters}
 
         elif action == "swap":
-            pipeline = job_input.get("pipeline", "fast")
             swaps = job_input.get("swaps", [])
-
             swap_targets = []
             for s in swaps:
                 src_img = decode_image(s["new_face"])
@@ -245,7 +228,7 @@ def handler(event):
                         "source_face": src_faces[0]
                     })
 
-            return execute_swap(tmp_media, is_video, swap_targets, pipeline=pipeline)
+            return execute_swap(tmp_media, is_video, swap_targets)
 
         return {"error": f"Unknown action '{action}'"}
 
