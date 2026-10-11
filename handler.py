@@ -15,22 +15,34 @@ print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
 
 try:
-    # 1. Verify CUDA execution provider
+    # 1. Verify available ONNX execution providers
     available_providers = ort.get_available_providers()
     print(f"Available ONNX providers: {available_providers}")
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if 'CUDAExecutionProvider' in available_providers else ['CPUExecutionProvider']
+    providers = (
+        ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        if 'CUDAExecutionProvider' in available_providers
+        else ['CPUExecutionProvider']
+    )
     print(f"Selected providers: {providers}")
 
     # 2. Warm load InsightFace Buffalo_L face detector
     print("Loading buffalo_l detector...")
-    face_app = insightface.app.FaceAnalysis(name="buffalo_l", root="/root/.insightface", providers=providers)
+    face_app = insightface.app.FaceAnalysis(
+        name="buffalo_l",
+        root="/root/.insightface",
+        providers=providers
+    )
     ctx_id = 0 if 'CUDAExecutionProvider' in providers else -1
     face_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
 
-    # 3. Warm load Inswapper ONNX model directly with matching providers
+    # 3. Warm load Inswapper ONNX model directly with matched providers
     print("Loading Inswapper ONNX...")
     model_path = "/app/checkpoints/inswapper_128.onnx"
-    swapper = insightface.model_zoo.get_model(model_path, download=False, providers=providers)
+    swapper = insightface.model_zoo.get_model(
+        model_path,
+        download=False,
+        providers=providers
+    )
 
     print("=== Worker Successfully Initialized and Models Ready ===")
     sys.stdout.flush()
@@ -109,7 +121,7 @@ def detect_unique_people(media_path, is_video=True):
             x1, y1 = max(0, box[0]), max(0, box[1])
             x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
             crop = frame[y1:y2, x1:x2]
-            detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2-x1)*(y2-y1)})
+            detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2 - x1) * (y2 - y1)})
     else:
         cap = cv2.VideoCapture(media_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
@@ -127,7 +139,7 @@ def detect_unique_people(media_path, is_video=True):
                     x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
                     if (x2 - x1) > 40 and (y2 - y1) > 40:
                         crop = frame[y1:y2, x1:x2]
-                        detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2-x1)*(y2-y1)})
+                        detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2 - x1) * (y2 - y1)})
             frame_idx += 1
         cap.release()
 
