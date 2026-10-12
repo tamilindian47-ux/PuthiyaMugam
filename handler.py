@@ -30,20 +30,22 @@ try:
 
     providers = ['CUDAExecutionProvider']
 
-    print("Loading buffalo_l detector onto GPU...")
     face_app = insightface.app.FaceAnalysis(
         name="buffalo_l",
         root="/root/.insightface",
         allowed_modules=['detection', 'recognition'],
         providers=providers
     )
-    face_app.prepare(ctx_id=0, det_size=(640, 640))
+    face_app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
 
-    print("Loading Inswapper ONNX onto GPU...")
-    model_path = "/app/checkpoints/inswapper_128.onnx"
     swapper = insightface.model_zoo.get_model(
-        model_path,
+        "/app/checkpoints/inswapper_128.onnx",
         download=False,
+        providers=providers
+    )
+
+    occ_session = ort.InferenceSession(
+        "/app/checkpoints/face_occluder.onnx",
         providers=providers
     )
 
@@ -53,10 +55,20 @@ try:
         if 'CUDAExecutionProvider' not in active:
             raise RuntimeError(f"FATAL: '{name}' is NOT running on GPU (providers: {active})")
 
-    swapper_active = swapper.session.get_providers()
-    print(f"Inswapper active providers: {swapper_active}")
-    if 'CUDAExecutionProvider' not in swapper_active:
-        raise RuntimeError(f"FATAL: Inswapper is NOT running on GPU (providers: {swapper_active})")
+    for label, sess in [("Inswapper", swapper.session), ("Occluder", occ_session)]:
+        active = sess.get_providers()
+        print(f"{label} active providers: {active}")
+        if 'CUDAExecutionProvider' not in active:
+            raise RuntimeError(f"FATAL: {label} is NOT running on GPU (providers: {active})")
+
+    occ_input = occ_session.get_inputs()[0]
+    occ_shape = occ_input.shape
+    print(f"Occluder input: {occ_input.name} {occ_shape}")
+    occ_nchw = (len(occ_shape) == 4 and occ_shape[1] == 3)
+    try:
+        occ_size = (int(occ_shape[3]), int(occ_shape[2])) if occ_nchw else (int(occ_shape[2]), int(occ_shape[1]))
+    except Exception:
+        occ_size = (256, 256)
 
     print("=== Worker Successfully Initialized: Models Residing in VRAM ===")
     sys.stdout.flush()
@@ -68,6 +80,41 @@ except Exception as init_err:
     raise init_err
 
 
+def occlusion_mask(crop_bgr):
+    img = cv2.resize(crop_bgr, occ_size).astype(np.float32) / 255.0
+    if occ_nchw:
+        img = img.transpose(2, 0, 1)
+    out = occ_session.run(None, {occ_input.name: img[None]})[0][0]
+    m = np.clip(np.squeeze(out), 0, 1).astype(np.float32)
+    m = cv2.resize(m, (crop_bgr.shape[1], crop_bgr.shape[0]))
+    m = (np.clip(cv2.GaussianBlur(m, (0, 0), 5), 0.5, 1) - 0.5) * 2
+    return m
+
+
+def box_mask(size=128, blur=0.5):
+    amount = int(size * 0.5 * blur)
+    edge = max(amount // 2, 1)
+    m = np.ones((size, size), np.float32)
+    m[:edge, :] = 0
+    m[-edge:, :] = 0
+    m[:, :edge] = 0
+    m[:, -edge:] = 0
+    return cv2.GaussianBlur(m, (0, 0), max(amount * 0.25, 0.1))
+
+
+def swap_face(frame, face, source_face):
+    bgr_fake, M = swapper.get(frame, face, source_face, paste_back=False)
+    bgr_fake = np.ascontiguousarray(bgr_fake)
+    h, w = frame.shape[:2]
+    crop = cv2.warpAffine(frame, M, (128, 128), borderValue=0)
+    mask = np.minimum(box_mask(), occlusion_mask(crop))
+    IM = cv2.invertAffineTransform(M)
+    fake_w = cv2.warpAffine(bgr_fake, IM, (w, h), borderValue=0).astype(np.float32)
+    mask_w = cv2.warpAffine(mask, IM, (w, h), borderValue=0)[:, :, None]
+    out = frame.astype(np.float32) * (1 - mask_w) + fake_w * mask_w
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def resolve_input_to_file(data_or_url, out_path):
     if data_or_url.startswith("http://") or data_or_url.startswith("https://"):
         resp = requests.get(data_or_url, timeout=60)
@@ -77,9 +124,8 @@ def resolve_input_to_file(data_or_url, out_path):
     else:
         if "," in data_or_url:
             data_or_url = data_or_url.split(",", 1)[1]
-        raw_bytes = base64.b64decode(data_or_url)
         with open(out_path, "wb") as f:
-            f.write(raw_bytes)
+            f.write(base64.b64decode(data_or_url))
 
 
 def decode_image(data_or_url):
@@ -110,32 +156,34 @@ def cluster_embeddings_numpy(detections, threshold=0.42):
     unique_characters = []
     for l, c_indices in enumerate(clusters):
         best_idx = max(c_indices, key=lambda idx: detections[idx]['score'])
-        cluster_vecs = [detections[idx]['embedding'] for idx in c_indices]
-        centroid = np.mean(cluster_vecs, axis=0)
+        centroid = np.mean([detections[idx]['embedding'] for idx in c_indices], axis=0)
         centroid = centroid / np.linalg.norm(centroid)
-
         _, buf = cv2.imencode(".jpg", detections[best_idx]['crop'])
-        thumb_b64 = base64.b64encode(buf).decode("utf-8")
-
         unique_characters.append({
             "character_id": int(l),
-            "thumbnail_base64": thumb_b64,
+            "thumbnail_base64": base64.b64encode(buf).decode("utf-8"),
             "embedding": centroid.tolist()
         })
     return unique_characters
 
 
+def collect_faces(frame, detections, min_size=0):
+    for f in face_app.get(frame):
+        box = f.bbox.astype(int)
+        x1, y1 = max(0, box[0]), max(0, box[1])
+        x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
+        if (x2 - x1) > min_size and (y2 - y1) > min_size:
+            detections.append({
+                'crop': frame[y1:y2, x1:x2],
+                'embedding': f.normed_embedding,
+                'score': (x2 - x1) * (y2 - y1)
+            })
+
+
 def detect_unique_people(media_path, is_animation=True):
     detections = []
     if not is_animation:
-        frame = cv2.imread(media_path)
-        faces = face_app.get(frame)
-        for f in faces:
-            box = f.bbox.astype(int)
-            x1, y1 = max(0, box[0]), max(0, box[1])
-            x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
-            crop = frame[y1:y2, x1:x2]
-            detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2 - x1) * (y2 - y1)})
+        collect_faces(cv2.imread(media_path), detections)
     else:
         cap = cv2.VideoCapture(media_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
@@ -146,33 +194,28 @@ def detect_unique_people(media_path, is_animation=True):
             if not ret:
                 break
             if frame_idx % step == 0:
-                faces = face_app.get(frame)
-                for f in faces:
-                    box = f.bbox.astype(int)
-                    x1, y1 = max(0, box[0]), max(0, box[1])
-                    x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
-                    if (x2 - x1) > 40 and (y2 - y1) > 40:
-                        crop = frame[y1:y2, x1:x2]
-                        detections.append({'crop': crop, 'embedding': f.normed_embedding, 'score': (x2 - x1) * (y2 - y1)})
+                collect_faces(frame, detections, min_size=40)
             frame_idx += 1
         cap.release()
 
     if not detections:
         return []
-
     return cluster_embeddings_numpy(detections)
+
+
+def apply_swaps(frame, swap_targets):
+    for face in face_app.get(frame):
+        for target in swap_targets:
+            sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
+            if sim >= 0.40:
+                frame = swap_face(frame, face, target["source_face"])
+                break
+    return frame
 
 
 def execute_swap(media_path, media_type, swap_targets):
     if media_type == "image":
-        frame = cv2.imread(media_path)
-        faces = face_app.get(frame)
-        for face in faces:
-            for target in swap_targets:
-                sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
-                if sim >= 0.40:
-                    frame = swapper.get(frame, face, target["source_face"], paste_back=True)
-                    break
+        frame = apply_swaps(cv2.imread(media_path), swap_targets)
         _, out_buf = cv2.imencode(".jpg", frame)
         return {"status": "success", "media_type": "image", "base64": base64.b64encode(out_buf).decode("utf-8")}
 
@@ -192,14 +235,7 @@ def execute_swap(media_path, media_type, swap_targets):
         ret, frame = cap.read()
         if not ret:
             break
-        faces = face_app.get(frame)
-        for face in faces:
-            for target in swap_targets:
-                sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
-                if sim >= 0.40:
-                    frame = swapper.get(frame, face, target["source_face"], paste_back=True)
-                    break
-        writer.write(frame)
+        writer.write(apply_swaps(frame, swap_targets))
 
     cap.release()
     writer.release()
@@ -236,17 +272,13 @@ def handler(event):
         return {"error": "Missing 'media' payload."}
 
     if job_input.get("is_gif") or (isinstance(media_data, str) and ".gif" in media_data.lower()[:100]):
-        media_type = "gif"
-        ext = "gif"
+        media_type, ext = "gif", "gif"
     elif job_input.get("is_video", True):
-        media_type = "video"
-        ext = "mp4"
+        media_type, ext = "video", "mp4"
     else:
-        media_type = "image"
-        ext = "jpg"
+        media_type, ext = "image", "jpg"
 
-    req_id = uuid.uuid4().hex[:8]
-    tmp_media = f"/tmp/input_{req_id}.{ext}"
+    tmp_media = f"/tmp/input_{uuid.uuid4().hex[:8]}.{ext}"
 
     try:
         resolve_input_to_file(media_data, tmp_media)
@@ -256,17 +288,14 @@ def handler(event):
             return {"status": "success", "characters": characters}
 
         elif action == "swap":
-            swaps = job_input.get("swaps", [])
             swap_targets = []
-            for s in swaps:
-                src_img = decode_image(s["new_face"])
-                src_faces = face_app.get(src_img)
+            for s in job_input.get("swaps", []):
+                src_faces = face_app.get(decode_image(s["new_face"]))
                 if src_faces:
                     swap_targets.append({
                         "target_embedding": np.array(s["target_embedding"], dtype=np.float32),
                         "source_face": src_faces[0]
                     })
-
             return execute_swap(tmp_media, media_type, swap_targets)
 
         return {"error": f"Unknown action '{action}'"}
