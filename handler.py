@@ -11,6 +11,10 @@ import onnxruntime as ort
 import insightface
 import runpod
 
+CRF = os.environ.get("OUTPUT_CRF", "17")
+PRESET = os.environ.get("OUTPUT_PRESET", "fast")
+ENHANCE_BLEND = float(os.environ.get("ENHANCE_BLEND", "0.7"))
+
 print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
 
@@ -22,44 +26,34 @@ try:
 
     available_providers = ort.get_available_providers()
     print(f"Available ONNX providers detected: {available_providers}")
-
     if 'CUDAExecutionProvider' not in available_providers:
-        raise RuntimeError(
-            f"FATAL: CUDAExecutionProvider was not found by ONNX Runtime! Detected: {available_providers}"
-        )
+        raise RuntimeError(f"FATAL: CUDAExecutionProvider not found! Detected: {available_providers}")
 
-    providers = ['CUDAExecutionProvider']
+    providers = [("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"})]
 
     face_app = insightface.app.FaceAnalysis(
-        name="buffalo_l",
-        root="/root/.insightface",
-        allowed_modules=['detection', 'recognition'],
-        providers=providers
+        name="buffalo_l", root="/root/.insightface",
+        allowed_modules=['detection', 'recognition'], providers=providers
     )
     face_app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
 
     swapper = insightface.model_zoo.get_model(
-        "/app/checkpoints/inswapper_128.onnx",
-        download=False,
-        providers=providers
+        "/app/checkpoints/inswapper_128.onnx", download=False, providers=providers
     )
-
-    occ_session = ort.InferenceSession(
-        "/app/checkpoints/face_occluder.onnx",
-        providers=providers
-    )
+    occ_session = ort.InferenceSession("/app/checkpoints/face_occluder.onnx", providers=providers)
+    enh_session = ort.InferenceSession("/app/checkpoints/enhancer.onnx", providers=providers)
 
     for name, m in face_app.models.items():
         active = m.session.get_providers()
         print(f"Model '{name}' active providers: {active}")
         if 'CUDAExecutionProvider' not in active:
-            raise RuntimeError(f"FATAL: '{name}' is NOT running on GPU (providers: {active})")
+            raise RuntimeError(f"FATAL: '{name}' is NOT on GPU (providers: {active})")
 
-    for label, sess in [("Inswapper", swapper.session), ("Occluder", occ_session)]:
+    for label, sess in [("Inswapper", swapper.session), ("Occluder", occ_session), ("Enhancer", enh_session)]:
         active = sess.get_providers()
         print(f"{label} active providers: {active}")
         if 'CUDAExecutionProvider' not in active:
-            raise RuntimeError(f"FATAL: {label} is NOT running on GPU (providers: {active})")
+            raise RuntimeError(f"FATAL: {label} is NOT on GPU (providers: {active})")
 
     occ_input = occ_session.get_inputs()[0]
     occ_shape = occ_input.shape
@@ -69,6 +63,14 @@ try:
         occ_size = (int(occ_shape[3]), int(occ_shape[2])) if occ_nchw else (int(occ_shape[2]), int(occ_shape[1]))
     except Exception:
         occ_size = (256, 256)
+
+    enh_input_name = enh_session.get_inputs()[0].name
+    enh_size = int(enh_session.get_inputs()[0].shape[2])
+    FFHQ_TEMPLATE = np.array([
+        [0.37691676, 0.46864664], [0.62285697, 0.46912813], [0.50123859, 0.61331904],
+        [0.39308822, 0.72541100], [0.61150205, 0.72490465],
+    ], dtype=np.float32) * enh_size
+    print(f"Enhancer input: {enh_input_name} size={enh_size}")
 
     print("=== Worker Successfully Initialized: Models Residing in VRAM ===")
     sys.stdout.flush()
@@ -112,6 +114,35 @@ def swap_face(frame, face, source_face):
     fake_w = cv2.warpAffine(bgr_fake, IM, (w, h), borderValue=0).astype(np.float32)
     mask_w = cv2.warpAffine(mask, IM, (w, h), borderValue=0)[:, :, None]
     out = frame.astype(np.float32) * (1 - mask_w) + fake_w * mask_w
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def run_enhancer(crop_bgr):
+    x = crop_bgr[:, :, ::-1].astype(np.float32) / 255.0
+    x = (x - 0.5) / 0.5
+    x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
+    y = enh_session.run(None, {enh_input_name: x})[0][0]
+    y = (np.clip(y, -1, 1) + 1) / 2
+    y = np.clip(np.rint(y.transpose(1, 2, 0) * 255), 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(y[:, :, ::-1])
+
+
+def enhance_face(swapped, original, face, blend=ENHANCE_BLEND):
+    kps = face.kps.astype(np.float32)
+    M, _ = cv2.estimateAffinePartial2D(kps, FFHQ_TEMPLATE, method=cv2.LMEDS)
+    if M is None:
+        return swapped
+    h, w = swapped.shape[:2]
+    s = enh_size
+    crop = cv2.warpAffine(swapped, M, (s, s), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA)
+    orig_crop = cv2.warpAffine(original, M, (s, s), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA)
+    enhanced = run_enhancer(crop)
+    enhanced = crop.astype(np.float32) * (1 - blend) + enhanced.astype(np.float32) * blend
+    mask = np.minimum(box_mask(s, 0.3), occlusion_mask(orig_crop))
+    IM = cv2.invertAffineTransform(M)
+    enh_w = cv2.warpAffine(enhanced, IM, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+    mask_w = cv2.warpAffine(mask, IM, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)[:, :, None]
+    out = swapped.astype(np.float32) * (1 - mask_w) + enh_w.astype(np.float32) * mask_w
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -197,66 +228,88 @@ def detect_unique_people(media_path, is_animation=True):
                 collect_faces(frame, detections, min_size=40)
             frame_idx += 1
         cap.release()
-
     if not detections:
         return []
     return cluster_embeddings_numpy(detections)
 
 
-def apply_swaps(frame, swap_targets):
+def apply_swaps(frame, swap_targets, enhance=False):
     for face in face_app.get(frame):
         for target in swap_targets:
             sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
             if sim >= 0.40:
+                original = frame
                 frame = swap_face(frame, face, target["source_face"])
+                if enhance:
+                    frame = enhance_face(frame, original, face)
                 break
     return frame
 
 
-def execute_swap(media_path, media_type, swap_targets):
+def execute_swap(media_path, media_type, swap_targets, pipeline="fast"):
+    enhance = pipeline in ("gfpgan", "codeformer")
+    print(f"Pipeline: {pipeline} | enhance={enhance} | CRF={CRF} preset={PRESET}")
+
     if media_type == "image":
-        frame = apply_swaps(cv2.imread(media_path), swap_targets)
-        _, out_buf = cv2.imencode(".jpg", frame)
+        frame = apply_swaps(cv2.imread(media_path), swap_targets, enhance)
+        _, out_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 97])
         return {"status": "success", "media_type": "image", "base64": base64.b64encode(out_buf).decode("utf-8")}
 
     temp_id = uuid.uuid4().hex[:8]
-    tmp_swapped_mp4 = f"/tmp/swap_{temp_id}.mp4"
-    tmp_final = f"/tmp/final_{temp_id}.{ 'gif' if media_type == 'gif' else 'mp4' }"
+    tmp_mp4 = f"/tmp/final_{temp_id}.mp4"
+    tmp_gif = f"/tmp/final_{temp_id}.gif"
 
     cap = cv2.VideoCapture(media_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    if fps <= 0 or fps > 60:
-        fps = 20.0
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(tmp_swapped_mp4, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if fps <= 0 or fps > 120:
+        fps = 25.0
+    ok, first = cap.read()
+    if not ok:
+        raise RuntimeError("Could not read first frame of video")
+    h, w = first.shape[:2]
+    w2, h2 = w - (w % 2), h - (h % 2)
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        writer.write(apply_swaps(frame, swap_targets))
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w2}x{h2}", "-r", f"{fps}", "-i", "-",
+        "-i", media_path,
+        "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
+        tmp_mp4
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-    cap.release()
-    writer.release()
+    frame = first
+    try:
+        while True:
+            out = apply_swaps(frame, swap_targets, enhance)
+            if out.shape[1] != w2 or out.shape[0] != h2:
+                out = out[:h2, :w2]
+            proc.stdin.write(np.ascontiguousarray(out).tobytes())
+            ret, frame = cap.read()
+            if not ret:
+                break
+    finally:
+        cap.release()
+        proc.stdin.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg encode failed with code {rc}")
 
+    final_path = tmp_mp4
     if media_type == "gif":
         subprocess.run([
-            "ffmpeg", "-y", "-i", tmp_swapped_mp4,
+            "ffmpeg", "-y", "-i", tmp_mp4,
             "-vf", "split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5",
-            "-loop", "0", tmp_final
+            "-loop", "0", tmp_gif
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    else:
-        subprocess.run([
-            "ffmpeg", "-y", "-i", tmp_swapped_mp4, "-i", media_path,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
-            "-map", "0:v:0", "-map", "1:a:0?", "-shortest", tmp_final
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        final_path = tmp_gif
 
-    with open(tmp_final, "rb") as f:
+    with open(final_path, "rb") as f:
         media_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    for fpath in [tmp_swapped_mp4, tmp_final]:
+    for fpath in [tmp_mp4, tmp_gif]:
         if os.path.exists(fpath):
             os.remove(fpath)
 
@@ -267,6 +320,7 @@ def handler(event):
     job_input = event.get("input", {})
     action = job_input.get("action", "swap")
     media_data = job_input.get("media")
+    pipeline = job_input.get("pipeline", "fast")
 
     if not media_data:
         return {"error": "Missing 'media' payload."}
@@ -296,7 +350,7 @@ def handler(event):
                         "target_embedding": np.array(s["target_embedding"], dtype=np.float32),
                         "source_face": src_faces[0]
                     })
-            return execute_swap(tmp_media, media_type, swap_targets)
+            return execute_swap(tmp_media, media_type, swap_targets, pipeline)
 
         return {"error": f"Unknown action '{action}'"}
 
