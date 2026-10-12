@@ -36,6 +36,13 @@ RUN wget --tries=5 --timeout=60 -O /app/checkpoints/face_occluder.onnx \
       "https://github.com/facefusion/facefusion-assets/releases/download/models/face_occluder.onnx"; \
     test -s /app/checkpoints/face_occluder.onnx
 
+# NEW: face enhancer (GPEN-BFR 512, falls back to 256)
+RUN wget --tries=5 --timeout=60 -O /app/checkpoints/enhancer.onnx \
+      "https://huggingface.co/facefusion/models-3.0.0/resolve/main/gpen_bfr_512.onnx" \
+    || wget --tries=5 --timeout=60 -O /app/checkpoints/enhancer.onnx \
+      "https://huggingface.co/facefusion/models-3.0.0/resolve/main/gpen_bfr_256.onnx"; \
+    test -s /app/checkpoints/enhancer.onnx
+
 RUN mkdir -p /root/.insightface/models/buffalo_l && \
     ( curl -fL --retry 5 --retry-delay 5 -o /tmp/buffalo_l.zip "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip" || \
       curl -fL --retry 5 --retry-delay 5 -o /tmp/buffalo_l.zip "https://huggingface.co/techwavelaps/aceplus-face/resolve/main/insightface/models/buffalo_l.zip" ) && \
