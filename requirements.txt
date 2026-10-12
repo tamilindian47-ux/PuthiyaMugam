@@ -1,8 +1,6 @@
-runpod
+runpod>=1.7.0
 numpy==1.26.4
-onnxruntime-gpu
-insightface==0.7.3
 opencv-python-headless
-pillow
-requests
-tqdm
+insightface>=0.7.3
+onnxruntime-gpu>=1.17.0
+torch torchvision --index-url https://download.pytorch.org/whl/cu121
