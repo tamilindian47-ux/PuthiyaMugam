@@ -1,10 +1,5 @@
 import os
 import sys
-
-# CRITICAL: Importing torch first registers CUDA & cuDNN shared libraries
-# into Python's address space so ONNX Runtime can find CUDAExecutionProvider
-import torch
-
 import cv2
 import uuid
 import base64
@@ -17,35 +12,26 @@ import insightface
 import runpod
 
 print("=== Starting Worker Initialization ===")
-print(f"PyTorch CUDA Available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"PyTorch Device Name: {torch.cuda.get_device_name(0)}")
-
-# Dynamically add torch's bundled CUDA/cuDNN libraries to LD_LIBRARY_PATH
-torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
-os.environ["LD_LIBRARY_PATH"] = f"{torch_lib_path}:{os.environ.get('LD_LIBRARY_PATH', '')}"
-
 sys.stdout.flush()
 
 try:
     available_providers = ort.get_available_providers()
     print(f"Available ONNX providers detected: {available_providers}")
 
-    # Set strict GPU provider settings
-    providers = [
-        ('CUDAExecutionProvider', {
-            'device_id': 0,
-            'arena_extend_strategy': 'kNextPowerOfTwo',
-            'cudnn_conv_algo_search': 'DEFAULT',
-        }),
-        'CPUExecutionProvider'
-    ]
+    # HARD FAIL: Ensure worker runs exclusively on GPU
+    if 'CUDAExecutionProvider' not in available_providers:
+        raise RuntimeError(
+            f"FATAL: CUDAExecutionProvider was not found by ONNX Runtime! Detected: {available_providers}"
+        )
 
-    # 1. Warm load Buffalo_L detector on GPU (ctx_id=0)
+    providers = ['CUDAExecutionProvider']
+
+    # 1. Warm load Buffalo_L detector on GPU (only detection and recognition models)
     print("Loading buffalo_l detector onto GPU...")
     face_app = insightface.app.FaceAnalysis(
         name="buffalo_l",
         root="/root/.insightface",
+        allowed_modules=['detection', 'recognition'],
         providers=providers
     )
     face_app.prepare(ctx_id=0, det_size=(640, 640))
@@ -59,7 +45,7 @@ try:
         providers=providers
     )
 
-    print("=== Worker Successfully Initialized and Models Loaded to GPU ===")
+    print("=== Worker Successfully Initialized: Models Residing in VRAM ===")
     sys.stdout.flush()
 
 except Exception as init_err:
@@ -126,9 +112,9 @@ def cluster_embeddings_numpy(detections, threshold=0.42):
     return unique_characters
 
 
-def detect_unique_people(media_path, is_video=True):
+def detect_unique_people(media_path, is_animation=True):
     detections = []
-    if not is_video:
+    if not is_animation:
         frame = cv2.imread(media_path)
         faces = face_app.get(frame)
         for f in faces:
@@ -164,8 +150,9 @@ def detect_unique_people(media_path, is_video=True):
     return cluster_embeddings_numpy(detections)
 
 
-def execute_swap(media_path, is_video, swap_targets):
-    if not is_video:
+def execute_swap(media_path, media_type, swap_targets):
+    # Case 1: Static Image
+    if media_type == "image":
         frame = cv2.imread(media_path)
         faces = face_app.get(frame)
         for face in faces:
@@ -177,15 +164,18 @@ def execute_swap(media_path, is_video, swap_targets):
         _, out_buf = cv2.imencode(".jpg", frame)
         return {"status": "success", "media_type": "image", "base64": base64.b64encode(out_buf).decode("utf-8")}
 
+    # Case 2: Video or Animated GIF
     temp_id = uuid.uuid4().hex[:8]
-    tmp_swapped = f"/tmp/swap_{temp_id}.mp4"
-    tmp_final = f"/tmp/final_{temp_id}.mp4"
+    tmp_swapped_mp4 = f"/tmp/swap_{temp_id}.mp4"
+    tmp_final = f"/tmp/final_{temp_id}.{ 'gif' if media_type == 'gif' else 'mp4' }"
 
     cap = cv2.VideoCapture(media_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if fps <= 0 or fps > 60:
+        fps = 20.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(tmp_swapped, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    writer = cv2.VideoWriter(tmp_swapped_mp4, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -203,40 +193,57 @@ def execute_swap(media_path, is_video, swap_targets):
     cap.release()
     writer.release()
 
-    subprocess.run([
-        "ffmpeg", "-y", "-i", tmp_swapped, "-i", media_path,
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
-        "-map", "0:v:0", "-map", "1:a:0?", "-shortest", tmp_final
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    # Post-processing: Remux audio for MP4 or generate high-quality GIF with palettegen
+    if media_type == "gif":
+        subprocess.run([
+            "ffmpeg", "-y", "-i", tmp_swapped_mp4,
+            "-vf", "split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5",
+            "-loop", "0", tmp_final
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    else:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", tmp_swapped_mp4, "-i", media_path,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-map", "0:v:0", "-map", "1:a:0?", "-shortest", tmp_final
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
     with open(tmp_final, "rb") as f:
-        vid_b64 = base64.b64encode(f.read()).decode("utf-8")
+        media_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    for fpath in [tmp_swapped, tmp_final]:
+    for fpath in [tmp_swapped_mp4, tmp_final]:
         if os.path.exists(fpath):
             os.remove(fpath)
 
-    return {"status": "success", "media_type": "video", "base64": vid_b64}
+    return {"status": "success", "media_type": media_type, "base64": media_b64}
 
 
 def handler(event):
     job_input = event.get("input", {})
     action = job_input.get("action", "swap")
     media_data = job_input.get("media")
-    is_video = job_input.get("is_video", True)
 
     if not media_data:
         return {"error": "Missing 'media' payload."}
 
+    # Determine media format: "image", "video", or "gif"
+    if job_input.get("is_gif") or (isinstance(media_data, str) and ".gif" in media_data.lower()[:100]):
+        media_type = "gif"
+        ext = "gif"
+    elif job_input.get("is_video", True):
+        media_type = "video"
+        ext = "mp4"
+    else:
+        media_type = "image"
+        ext = "jpg"
+
     req_id = uuid.uuid4().hex[:8]
-    ext = "mp4" if is_video else "jpg"
     tmp_media = f"/tmp/input_{req_id}.{ext}"
 
     try:
         resolve_input_to_file(media_data, tmp_media)
 
         if action == "detect":
-            characters = detect_unique_people(tmp_media, is_video=is_video)
+            characters = detect_unique_people(tmp_media, is_animation=(media_type in ["video", "gif"]))
             return {"status": "success", "characters": characters}
 
         elif action == "swap":
@@ -251,7 +258,7 @@ def handler(event):
                         "source_face": src_faces[0]
                     })
 
-            return execute_swap(tmp_media, is_video, swap_targets)
+            return execute_swap(tmp_media, media_type, swap_targets)
 
         return {"error": f"Unknown action '{action}'"}
 
