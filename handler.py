@@ -12,19 +12,18 @@ print("[Worker] Initializing Models & Providers...")
 
 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
+# 1. Initialize Face Detection & Alignment
 face_app = FaceAnalysis(name="buffalo_l", providers=providers)
 face_app.prepare(ctx_id=0, det_size=(640, 640))
 
+# 2. Load Inswapper Model
 SWAPPER_PATH = os.environ.get("SWAPPER_PATH", "/models/inswapper_128.onnx")
 if not os.path.exists(SWAPPER_PATH):
     SWAPPER_PATH = os.path.expanduser("~/.insightface/models/inswapper_128.onnx")
 
-swapper = insightface.model_zoo.get_model(
-    SWAPPER_PATH,
-    download=False,
-    providers=providers
-)
+swapper = insightface.model_zoo.get_model(SWAPPER_PATH, download=False, providers=providers)
 
+# 3. Optional Enhancers
 gfpgan_enhancer = None
 try:
     from gfpgan import GFPGANer
@@ -40,88 +39,65 @@ try:
         )
         print("[Worker] GFPGAN successfully loaded.")
 except Exception as e:
-    print(f"[Worker] GFPGAN init skipped/deferred: {e}")
+    print(f"[Worker] GFPGAN skipped: {e}")
 
-print("[Worker] Successfully Initialized and Ready for Jobs.")
-
-
-def strip_data_uri_prefix(base64_str: str) -> str:
-    if "," in base64_str:
-        return base64_str.split(",", 1)[1]
-    return base64_str
+print("[Worker] Initialized and Ready.")
 
 
-def decode_base64_bytes(base64_str: str) -> bytes:
-    clean_b64 = strip_data_uri_prefix(base64_str)
-    return base64.b64decode(clean_b64)
+def strip_prefix(b64_str: str) -> str:
+    return b64_str.split(",", 1)[1] if "," in b64_str else b64_str
 
 
-def decode_base64_img(base64_str: str) -> np.ndarray:
-    img_data = decode_base64_bytes(base64_str)
-    np_arr = np.frombuffer(img_data, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    return img
+def decode_bytes(b64_str: str) -> bytes:
+    return base64.b64decode(strip_prefix(b64_str))
 
 
-def decode_media_frame(base64_str: str) -> np.ndarray:
-    media_bytes = decode_base64_bytes(base64_str)
+def decode_img(b64_str: str) -> np.ndarray:
+    data = decode_bytes(b64_str)
+    np_arr = np.frombuffer(data, np.uint8)
+    return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
+
+def encode_img_b64(img_bgr: np.ndarray) -> str:
+    _, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    return base64.b64encode(buf).decode("utf-8")
+
+
+def extract_first_frame(media_bytes: bytes) -> np.ndarray:
+    """Extracts first valid frame from image or video bytes."""
+    # Try as static image first
     np_arr = np.frombuffer(media_bytes, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if img is not None and getattr(img, "size", 0) > 0:
+    if img is not None and img.size > 0:
         return img
 
-    temp_path = None
-    for suffix in [".mp4", ".mov", ".gif", ".webm", ".bin"]:
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(media_bytes)
-                temp_path = tmp.name
+    # Try as video/gif container
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(media_bytes)
+        tmp_path = tmp.name
 
-            cap = cv2.VideoCapture(temp_path)
-            ok, frame = cap.read()
-            cap.release()
+    cap = cv2.VideoCapture(tmp_path)
+    ok, frame = cap.read()
+    cap.release()
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
 
-            if ok and frame is not None and getattr(frame, "size", 0) > 0:
-                return frame
-        except Exception:
-            pass
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
-            temp_path = None
-
-    return None
-
-
-def encode_img_base64(img_bgr: np.ndarray, ext: str = ".jpg") -> str:
-    ok, buffer = cv2.imencode(ext, img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-    if not ok:
-        raise ValueError("Failed to encode output image.")
-    return base64.b64encode(buffer).decode("utf-8")
+    return frame if (ok and frame is not None and frame.size > 0) else None
 
 
 def detect_faces(img_bgr: np.ndarray):
-    if img_bgr is None or not hasattr(img_bgr, "shape") or img_bgr.size == 0:
-        raise ValueError("detect_faces received an empty or invalid image.")
-
+    """Detects all faces in frame and returns clean crops for the UI."""
     faces = face_app.get(img_bgr)
     results = []
-
     h, w = img_bgr.shape[:2]
 
     for idx, face in enumerate(faces):
         bbox = [int(v) for v in face.bbox.tolist()]
-        x1 = max(0, bbox[0])
-        y1 = max(0, bbox[1])
-        x2 = min(w, bbox[2])
-        y2 = min(h, bbox[3])
+        x1, y1 = max(0, bbox[0]), max(0, bbox[1])
+        x2, y2 = min(w, bbox[2]), min(h, bbox[3])
 
         crop = img_bgr[y1:y2, x1:x2]
-        crop_b64 = encode_img_base64(crop) if crop is not None and crop.size > 0 else ""
+        crop_b64 = encode_img_b64(crop) if crop.size > 0 else ""
 
         results.append({
             "index": idx,
@@ -129,31 +105,37 @@ def detect_faces(img_bgr: np.ndarray):
             "det_score": float(face.det_score) if hasattr(face, "det_score") else 1.0,
             "crop_base64": f"data:image/jpeg;base64,{crop_b64}"
         })
-
     return faces, results
 
 
 def apply_enhancer(img_bgr: np.ndarray, pipeline: str) -> np.ndarray:
     if pipeline == "gfpgan" and gfpgan_enhancer is not None:
         try:
-            _, _, restored_img = gfpgan_enhancer.enhance(
-                img_bgr,
-                has_aligned=False,
-                only_center_face=False,
-                paste_back=True
-            )
-            return restored_img
-        except Exception as e:
-            print(f"[Warning] GFPGAN enhancement failed: {e}")
+            _, _, res = gfpgan_enhancer.enhance(img_bgr, paste_back=True)
+            return res
+        except Exception:
             return img_bgr
     return img_bgr
 
 
-def pick_face(face_list, idx: int):
-    if not face_list:
-        return None
-    idx = max(0, min(int(idx), len(face_list) - 1))
-    return face_list[idx]
+def swap_frame_multi(frame: np.ndarray, target_faces_first_frame, mappings, pipeline: str):
+    """Swaps assigned faces on a single frame."""
+    current_faces = face_app.get(frame)
+    if not current_faces:
+        return frame
+
+    out = frame.copy()
+    for m in mappings:
+        t_idx = m["target_index"]
+        src_face = m["source_face"]
+
+        # Track face by proximity / index
+        if t_idx < len(current_faces):
+            out = swapper.get(out, current_faces[t_idx], src_face, paste_back=True)
+
+    if pipeline in ["gfpgan", "codeformer"]:
+        out = apply_enhancer(out, pipeline)
+    return out
 
 
 def handler(event):
@@ -161,101 +143,101 @@ def handler(event):
     action = job_input.get("action", "swap")
 
     if "target_image" not in job_input:
-        return {"error": "Missing 'target_image' in request payload."}
+        return {"error": "Missing 'target_image'"}
 
-    try:
-        if action == "detect":
-            target_img = decode_media_frame(job_input["target_image"])
-        else:
-            target_img = decode_base64_img(job_input["target_image"])
-            if target_img is None:
-                target_img = decode_media_frame(job_input["target_image"])
-    except Exception as e:
-        return {"error": f"Failed decoding target_image: {str(e)}"}
+    raw_bytes = decode_bytes(job_input["target_image"])
+    is_video = job_input.get("is_video", False)
+    pipeline = job_input.get("pipeline", "fast").lower()
 
-    if target_img is None:
-        return {"error": "target_image could not be decoded as an image or video frame."}
-
+    # -------------------------------------------------------------
+    # ACTION 1: DETECT FACES (Used for Image, GIF, and Video previews)
+    # -------------------------------------------------------------
     if action == "detect":
-        try:
-            _, face_data = detect_faces(target_img)
-            return {
-                "status": "success",
-                "faces_detected": len(face_data),
-                "faces": face_data
-            }
-        except Exception as e:
-            return {"error": f"Face detection failed: {str(e)}"}
+        first_frame = extract_first_frame(raw_bytes)
+        if first_frame is None:
+            return {"error": "Could not read media frames for detection."}
 
-    elif action == "swap":
-        if "source_image" not in job_input:
-            return {"error": "Missing 'source_image' for swap operation."}
-
-        try:
-            source_img = decode_base64_img(job_input["source_image"])
-        except Exception as e:
-            return {"error": f"Failed decoding source_image: {str(e)}"}
-
-        if source_img is None:
-            return {"error": "source_image could not be decoded as a valid image."}
-
-        source_faces = face_app.get(source_img)
-        if not source_faces:
-            return {"error": "No face found in source image."}
-
-        target_faces = face_app.get(target_img)
-        if not target_faces:
-            return {"error": "No face found in target image."}
-
-        pipeline = job_input.get("pipeline", "fast").lower()
-
-        faces_map = job_input.get("faces_map", None)
-        output_img = target_img.copy()
-
-        if faces_map and isinstance(faces_map, list):
-            for mapping in faces_map:
-                try:
-                    target_index = int(mapping.get("target_index", 0))
-                    src_b64 = mapping.get("source_image")
-
-                    if not src_b64:
-                        continue
-
-                    mapped_source_img = decode_base64_img(src_b64)
-                    if mapped_source_img is None:
-                        continue
-
-                    mapped_source_faces = face_app.get(mapped_source_img)
-                    if not mapped_source_faces:
-                        continue
-
-                    src_face = pick_face(mapped_source_faces, mapping.get("source_face_index", 0))
-                    tgt_face = pick_face(target_faces, target_index)
-
-                    if src_face is None or tgt_face is None:
-                        continue
-
-                    output_img = swapper.get(output_img, tgt_face, src_face, paste_back=True)
-                except Exception as e:
-                    print(f"[Warning] faces_map item skipped: {e}")
-                    continue
-        else:
-            s_idx = min(int(job_input.get("source_face_index", 0)), len(source_faces) - 1)
-            t_idx = min(int(job_input.get("target_face_index", 0)), len(target_faces) - 1)
-
-            source_face = source_faces[s_idx]
-            target_face = target_faces[t_idx]
-
-            output_img = swapper.get(output_img, target_face, source_face, paste_back=True)
-
-        if pipeline in ["gfpgan", "codeformer"]:
-            output_img = apply_enhancer(output_img, pipeline)
-
-        result_b64 = encode_img_base64(output_img)
+        _, face_data = detect_faces(first_frame)
         return {
             "status": "success",
-            "pipeline_used": pipeline,
-            "image": f"data:image/jpeg;base64,{result_b64}"
+            "faces_detected": len(face_data),
+            "faces": face_data
+        }
+
+    # -------------------------------------------------------------
+    # ACTION 2: SWAP FACES (With multi-mapping & apply-all support)
+    # -------------------------------------------------------------
+    elif action == "swap":
+        # Resolve all source faces from mappings
+        faces_map = job_input.get("faces_map", [])
+        if not faces_map and "source_image" in job_input:
+            faces_map = [{"target_index": 0, "source_image": job_input["source_image"]}]
+
+        if not faces_map:
+            return {"error": "No source image or faces_map provided."}
+
+        prepared_mappings = []
+        for m in faces_map:
+            s_img = decode_img(m["source_image"])
+            if s_img is not None:
+                s_faces = face_app.get(s_img)
+                if s_faces:
+                    prepared_mappings.append({
+                        "target_index": int(m.get("target_index", 0)),
+                        "source_face": s_faces[0]
+                    })
+
+        if not prepared_mappings:
+            return {"error": "No faces could be identified in any provided source images."}
+
+        # --- A. STATIC IMAGE SWAP ---
+        if not is_video:
+            target_img = decode_img(job_input["target_image"])
+            if target_img is None:
+                return {"error": "Failed to decode static target image."}
+
+            output_img = swap_frame_multi(target_img, None, prepared_mappings, pipeline)
+            return {
+                "status": "success",
+                "image": f"data:image/jpeg;base64,{encode_img_b64(output_img)}"
+            }
+
+        # --- B. FULL VIDEO / GIF FRAME-BY-FRAME SWAP ---
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as in_tmp:
+            in_tmp.write(raw_bytes)
+            in_video_path = in_tmp.name
+
+        out_video_path = in_video_path.replace(".mp4", "_out.mp4")
+
+        cap = cv2.VideoCapture(in_video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_video_path, fourcc, fps, (width, height))
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            swapped_frame = swap_frame_multi(frame, None, prepared_mappings, pipeline)
+            writer.write(swapped_frame)
+
+        cap.release()
+        writer.release()
+
+        with open(out_video_path, "rb") as f:
+            video_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        # Cleanup temp files
+        for p in [in_video_path, out_video_path]:
+            if os.path.exists(p):
+                os.remove(p)
+
+        return {
+            "status": "success",
+            "video": f"data:video/mp4;base64,{video_b64}"
         }
 
     return {"error": f"Unknown action '{action}'"}
