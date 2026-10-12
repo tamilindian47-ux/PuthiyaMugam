@@ -4,6 +4,7 @@ import cv2
 import base64
 import tempfile
 import subprocess
+import urllib.request
 import numpy as np
 import onnxruntime as ort
 import insightface
@@ -59,6 +60,11 @@ def get_gfpgan():
 
 
 def b64_to_bytes(s):
+    s = (s or "").strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        req = urllib.request.Request(s, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read()
     if "," in s[:100]:
         s = s.split(",", 1)[1]
     return base64.b64decode(s)
@@ -224,7 +230,7 @@ def handle_swap(media_b64, is_video, swaps, pipeline):
     assignments = build_assignments(swaps)
     if not assignments:
         return {"error": "No usable face found in the replacement photos"}
-    enhance = pipeline not in (None, "", "fast", "1", 1)
+    enhance = str(pipeline).lower() in ("pipeline2", "pipeline3", "gfpgan", "codeformer")
     data = b64_to_bytes(media_b64)
     kind = sniff_kind(data, is_video)
 
