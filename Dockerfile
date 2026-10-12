@@ -1,50 +1,41 @@
-FROM runpod/base:0.4.0-cuda11.8.0
+FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 
-# 1. System packages
+# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    libgl1 \
-    libglib2.0-0 \
+    git \
     wget \
-    curl \
-    unzip \
+    ffmpeg \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Python environment & GPU-matched dependencies
-# - onnxruntime-gpu==1.17.1 is built specifically for CUDA 11.8
-# - torch is installed with cu118 index to ensure CUDA acceleration and eliminate NumPy 2.x conflicts
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir "numpy==1.26.4" cython && \
-    python3 -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu118 && \
-    python3 -m pip install --no-cache-dir \
-        onnxruntime-gpu==1.17.1 \
-        insightface==0.7.3 \
-        opencv-python-headless \
-        pillow \
-        requests \
-        tqdm \
-        runpod && \
-    python3 -m pip install --no-cache-dir "numpy==1.26.4"
+# Strict dependency lock to prevent NumPy 2.x crash
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+    "numpy>=1.23.5,<2.0.0" \
+    opencv-python-headless \
+    onnxruntime-gpu \
+    insightface>=0.7.3 \
+    gfpgan \
+    basicsr \
+    facexlib \
+    runpod
 
-# 3. Bake Inswapper model into image
-RUN mkdir -p /app/checkpoints && \
-    wget --progress=dot:giga --tries=5 --timeout=60 \
-      -O /app/checkpoints/inswapper_128.onnx \
-      "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
-
-# 4. Download and extract buffalo_l manually
-RUN mkdir -p /root/.insightface/models/buffalo_l && \
-    ( curl -fL --retry 5 --retry-delay 5 -o /tmp/buffalo_l.zip "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip" || \
-      curl -fL --retry 5 --retry-delay 5 -o /tmp/buffalo_l.zip "https://huggingface.co/techwavelaps/aceplus-face/resolve/main/insightface/models/buffalo_l.zip" ) && \
-    unzip -q -o /tmp/buffalo_l.zip -d /root/.insightface/models/buffalo_l && \
-    rm -f /tmp/buffalo_l.zip
+# Pre-download Buffalo_l models & Inswapper 128
+RUN mkdir -p /root/.insightface/models/ && \
+    mkdir -p /models && \
+    wget -q https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip -O /tmp/buffalo_l.zip && \
+    unzip -q /tmp/buffalo_l.zip -d /root/.insightface/models/buffalo_l && \
+    rm /tmp/buffalo_l.zip && \
+    wget -q https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx -O /models/inswapper_128.onnx && \
+    wget -q https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth -O /models/GFPGANv1.4.pth
 
 COPY handler.py /app/handler.py
 
-CMD ["python3", "-u", "/app/handler.py"]
+CMD ["python", "-u", "/app/handler.py"]
