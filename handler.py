@@ -13,7 +13,8 @@ import runpod
 
 CRF = os.environ.get("OUTPUT_CRF", "17")
 PRESET = os.environ.get("OUTPUT_PRESET", "fast")
-ENHANCE_BLEND = float(os.environ.get("ENHANCE_BLEND", "0.7"))
+# Adjusted to 0.4 (40%) to prevent erasing micro-expressions and minor movement cues
+ENHANCE_BLEND = float(os.environ.get("ENHANCE_BLEND", "0.4"))
 
 print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
@@ -57,7 +58,6 @@ try:
 
     occ_input = occ_session.get_inputs()[0]
     occ_shape = occ_input.shape
-    print(f"Occluder input: {occ_input.name} {occ_shape}")
     occ_nchw = (len(occ_shape) == 4 and occ_shape[1] == 3)
     try:
         occ_size = (int(occ_shape[3]), int(occ_shape[2])) if occ_nchw else (int(occ_shape[2]), int(occ_shape[1]))
@@ -70,7 +70,6 @@ try:
         [0.37691676, 0.46864664], [0.62285697, 0.46912813], [0.50123859, 0.61331904],
         [0.39308822, 0.72541100], [0.61150205, 0.72490465],
     ], dtype=np.float32) * enh_size
-    print(f"Enhancer input: {enh_input_name} size={enh_size}")
 
     print("=== Worker Successfully Initialized: Models Residing in VRAM ===")
     sys.stdout.flush()
@@ -89,19 +88,19 @@ def occlusion_mask(crop_bgr):
     out = occ_session.run(None, {occ_input.name: img[None]})[0][0]
     m = np.clip(np.squeeze(out), 0, 1).astype(np.float32)
     m = cv2.resize(m, (crop_bgr.shape[1], crop_bgr.shape[0]))
-    m = (np.clip(cv2.GaussianBlur(m, (0, 0), 5), 0.5, 1) - 0.5) * 2
-    return m
+    m = (np.clip(cv2.GaussianBlur(m, (0, 0), 3), 0.4, 1) - 0.4) * 1.6
+    return np.clip(m, 0, 1)
 
 
-def box_mask(size=128, blur=0.5):
-    amount = int(size * 0.5 * blur)
+def box_mask(size=128, blur=0.4):
+    amount = int(size * 0.4 * blur)
     edge = max(amount // 2, 1)
     m = np.ones((size, size), np.float32)
     m[:edge, :] = 0
     m[-edge:, :] = 0
     m[:, :edge] = 0
     m[:, -edge:] = 0
-    return cv2.GaussianBlur(m, (0, 0), max(amount * 0.25, 0.1))
+    return cv2.GaussianBlur(m, (0, 0), max(amount * 0.2, 0.1))
 
 
 def swap_face(frame, face, source_face):
@@ -137,8 +136,9 @@ def enhance_face(swapped, original, face, blend=ENHANCE_BLEND):
     crop = cv2.warpAffine(swapped, M, (s, s), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA)
     orig_crop = cv2.warpAffine(original, M, (s, s), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA)
     enhanced = run_enhancer(crop)
+    # Low-strength blend to preserve subtle expression movements
     enhanced = crop.astype(np.float32) * (1 - blend) + enhanced.astype(np.float32) * blend
-    mask = np.minimum(box_mask(s, 0.3), occlusion_mask(orig_crop))
+    mask = np.minimum(box_mask(s, 0.25), occlusion_mask(orig_crop))
     IM = cv2.invertAffineTransform(M)
     enh_w = cv2.warpAffine(enhanced, IM, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
     mask_w = cv2.warpAffine(mask, IM, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)[:, :, None]
@@ -238,7 +238,7 @@ def apply_swaps(frame, swap_targets, enhance=False):
         for target in swap_targets:
             sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
             if sim >= 0.40:
-                original = frame
+                original = frame.copy()
                 frame = swap_face(frame, face, target["source_face"])
                 if enhance:
                     frame = enhance_face(frame, original, face)
@@ -247,8 +247,8 @@ def apply_swaps(frame, swap_targets, enhance=False):
 
 
 def execute_swap(media_path, media_type, swap_targets, pipeline="fast"):
-    enhance = pipeline in ("gfpgan", "codeformer")
-    print(f"Pipeline: {pipeline} | enhance={enhance} | CRF={CRF} preset={PRESET}")
+    enhance = pipeline in ("gfpgan", "codeformer", "enhanced")
+    print(f"Pipeline: {pipeline} | enhance={enhance} | blend={ENHANCE_BLEND} | CRF={CRF} preset={PRESET}")
 
     if media_type == "image":
         frame = apply_swaps(cv2.imread(media_path), swap_targets, enhance)
